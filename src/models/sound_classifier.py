@@ -1,16 +1,18 @@
 import numpy as np
 import resampy
 import os
+import librosa
+from scipy import stats
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # Reduce TensorFlow logging
 
 try:
     import tensorflow as tf
     import tensorflow_hub as hub
+    import crepe
 except ImportError as e:
     raise ImportError(
-        "Failed to import TensorFlow or TensorFlow Hub. "
-        "Please make sure you're using Python 3.10 or 3.11 and have installed "
-        "the correct versions from requirements.txt in a virtual environment."
+        "Failed to import required packages. "
+        "Please make sure you have installed the correct versions from requirements.txt"
     ) from e
 
 class SoundClassifier:
@@ -30,99 +32,131 @@ class SoundClassifier:
                 "and make sure you have the correct versions of TensorFlow and TensorFlow Hub."
             ) from e
         
+    def _initialize_sound_classes(self):
+        """Initialize the dictionary of sound classes with zero confidence"""
+        return {
+            # Drums and Percussion
+            'Drums': 0.0, 'Snare drum': 0.0, 'Bass drum': 0.0,
+            'Cymbal': 0.0, 'Hi-hat': 0.0, 'Percussion': 0.0,
+            # String instruments
+            'Guitar': 0.0, 'Electric guitar': 0.0, 'Bass guitar': 0.0,
+            'Acoustic guitar': 0.0, 'Piano': 0.0,
+            # Wind instruments
+            'Saxophone': 0.0, 'Trumpet': 0.0, 'Flute': 0.0, 'Clarinet': 0.0,
+            # Electronic
+            'Synthesizer': 0.0, 'Electronic': 0.0, 'Sample': 0.0,
+            # Voice
+            'Speech': 0.0, 'Male speech': 0.0, 'Female speech': 0.0,
+            'Singing': 0.0, 'Vocals': 0.0,
+            # Generic
+            'Music': 0.0
+        }
+
     def classify(self, waveform, sample_rate):
-        """Classify the audio and return detected sound types and their confidence scores"""
+        """Classify the audio using multiple analysis techniques"""
         try:
             # Ensure waveform is float32 and in the correct range (-1 to 1)
             waveform = waveform.astype(np.float32)
             if waveform.max() > 1.0 or waveform.min() < -1.0:
-                waveform = waveform / 32768.0  # Convert from int16
-            
-            # Ensure we have enough samples for resampling (at least 0.1 seconds)
-            min_samples = int(sample_rate * 0.1)
-            if len(waveform) < min_samples:
-                raise ValueError(f"Audio is too short. Need at least {min_samples} samples.")
-            
-            # Resample if needed (YAMNet expects 16kHz)
+                waveform = waveform / 32768.0
+
+            # Get initial YAMNet classification
             if sample_rate != 16000:
-                waveform = resampy.resample(waveform, sample_rate, 16000)
-            
-            # Run the model, get the scores
-            scores, embeddings, mel_spectrogram = self.model(waveform)
-            scores = scores.numpy()
-            
-            # Get frame-level predictions
-            frame_predictions = scores.argmax(axis=1)
-            unique_predictions, counts = np.unique(frame_predictions, return_counts=True)
-            
-            # Load YAMNet class names
-            class_map = self._load_class_map()
-            
-            # Initialize categories with specific mapping
-            specific_mappings = {
-                # Drums and Percussion
-                'drum': ['Drums'],
-                'snare': ['Snare drum'],
-                'bass drum': ['Bass drum'],
-                'cymbal': ['Cymbal'],
-                'hi-hat': ['Hi-hat'],
-                'tambourine': ['Percussion'],
-                'bongo': ['Percussion'],
-                'conga': ['Percussion'],
-                
-                # Guitar categories
-                'electric guitar': ['Electric guitar'],
-                'acoustic guitar': ['Acoustic guitar'],
-                'bass guitar': ['Bass guitar'],
-                'guitar': ['Guitar'],  # Generic guitar if not specific
-                
-                # Piano
-                'piano': ['Piano'],
-                'keyboard': ['Piano'],
-                
-                # Voice categories
-                'speech': ['Speech'],
-                'male voice': ['Male speech'],
-                'female voice': ['Female speech'],
-                'male speech': ['Male speech'],
-                'female speech': ['Female speech'],
-                'singing': ['Singing'],
-                'vocal': ['Vocals'],
-                'voice': ['Speech'],
-                
-                # Electronic
-                'synthesizer': ['Synthesizer'],
-                'synth': ['Synthesizer'],
-                'electronic': ['Electronic'],
-                'techno': ['Electronic'],
-                'sample': ['Sample']
-            }
-            
+                yamnet_waveform = resampy.resample(waveform, sample_rate, 16000)
+            else:
+                yamnet_waveform = waveform
+
+            # Run YAMNet model
+            scores, embeddings, mel_spectrogram = self.model(yamnet_waveform)
+            yamnet_scores = scores.numpy().mean(axis=0)
+
             # Initialize sound classes
-            sound_classes = {
-                'Drums': 0.0, 'Snare drum': 0.0, 'Bass drum': 0.0,
-                'Cymbal': 0.0, 'Hi-hat': 0.0, 'Percussion': 0.0,
-                'Guitar': 0.0, 'Electric guitar': 0.0, 'Bass guitar': 0.0,
-                'Acoustic guitar': 0.0, 'Piano': 0.0,
-                'Synthesizer': 0.0, 'Electronic': 0.0, 'Sample': 0.0,
-                'Speech': 0.0, 'Male speech': 0.0, 'Female speech': 0.0,
-                'Singing': 0.0, 'Vocals': 0.0,
-                'Music': 0.0
-            }
+            sound_classes = self._initialize_sound_classes()
+
+            # Extract audio features
+            spectral_centroids = librosa.feature.spectral_centroid(y=waveform, sr=sample_rate)[0]
+            spectral_bandwidth = librosa.feature.spectral_bandwidth(y=waveform, sr=sample_rate)[0]
+            spectral_rolloff = librosa.feature.spectral_rolloff(y=waveform, sr=sample_rate)[0]
+            zero_crossing = librosa.feature.zero_crossing_rate(waveform)[0]
+            mfcc = librosa.feature.mfcc(y=waveform, sr=sample_rate, n_mfcc=13)
+
+            # Analyze spectral features for instrument identification
+            spec_mean = np.mean(spectral_centroids)
+            spec_std = np.std(spectral_centroids)
+            zcr_mean = np.mean(zero_crossing)
             
-            # Process each frame's predictions
-            for pred_idx, count in zip(unique_predictions, counts):
-                class_name = class_map[pred_idx].lower()
-                confidence = count / len(frame_predictions)  # Normalize by total frames
-                
-                # Check specific mappings
-                for key, categories in specific_mappings.items():
-                    if key in class_name:
-                        for category in categories:
-                            sound_classes[category] = max(
-                                sound_classes[category],
-                                confidence * scores[:, pred_idx].mean()
-                            )
+            # Detect percussion instruments
+            if zcr_mean > 0.1 and spec_mean > 2000:
+                if spec_mean > 5000:
+                    sound_classes['Cymbal'] = 0.9
+                    sound_classes['Hi-hat'] = 0.8
+                elif spec_mean < 1000:
+                    sound_classes['Bass drum'] = 0.9
+                else:
+                    sound_classes['Snare drum'] = 0.85
+                sound_classes['Drums'] = 0.9
+
+            # Detect guitars
+            if 500 < spec_mean < 3000 and spec_std > 500:
+                if np.mean(spectral_bandwidth) > 2000:
+                    sound_classes['Electric guitar'] = 0.9
+                else:
+                    sound_classes['Acoustic guitar'] = 0.9
+                sound_classes['Guitar'] = 0.85
+
+            # Detect vocals
+            mfcc_std = np.std(mfcc, axis=1)
+            if np.mean(mfcc_std[1:5]) > 15:
+                sound_classes['Vocals'] = 0.9
+                if spec_mean > 1800:
+                    sound_classes['Female speech'] = 0.8
+                else:
+                    sound_classes['Male speech'] = 0.8
+
+            # Detect electronic sounds
+            if zcr_mean > 0.2 and spec_std < 500:
+                sound_classes['Electronic'] = 0.85
+                sound_classes['Synthesizer'] = 0.8
+
+            # Combine with YAMNet predictions
+            class_map = self._load_class_map()
+            for i, class_name in enumerate(class_map):
+                score = yamnet_scores[i]
+                if score > 0.3:
+                    class_name = class_name.lower()
+                    for sound_type in sound_classes.keys():
+                        if sound_type.lower() in class_name:
+                            sound_classes[sound_type] = max(sound_classes[sound_type], score)
+
+            # Only use Music category if no other instrument is detected with confidence
+            if any(v > 0.3 for k, v in sound_classes.items() if k != 'Music'):
+                sound_classes['Music'] = 0.0
+
+            return sound_classes
+
+        except Exception as e:
+            raise Exception(f"Error classifying audio: {str(e)}")
+
+    def _load_class_map(self):
+        """Load YAMNet class names"""
+        try:
+            import csv
+            import urllib.request
+            
+            class_map_url = "https://raw.githubusercontent.com/tensorflow/models/master/research/audioset/yamnet/yamnet_class_map.csv"
+            response = urllib.request.urlopen(class_map_url)
+            lines = [l.decode('utf-8') for l in response.readlines()]
+            reader = csv.reader(lines)
+            next(reader)  # Skip header
+            return [row[2] for row in reader]  # Return display names
+        except Exception:
+            # Fallback to basic class names if unable to load
+            return [
+                "Speech", "Male speech", "Female speech", "Vocals", "Singing",
+                "Drums", "Snare drum", "Bass drum", "Hi-hat", "Cymbal",
+                "Guitar", "Electric guitar", "Acoustic guitar", "Piano",
+                "Synthesizer", "Electronic music", "Music"
+            ]
             
             # Post-processing to improve detection
             # 1. If we detect electric guitar with high confidence, boost related categories
